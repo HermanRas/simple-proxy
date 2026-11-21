@@ -1,0 +1,98 @@
+# Builds the simple-proxy image, proves it proxies HTTP and HTTPS and enforces
+# basic auth, and publishes it to GHCR as ghcr.io/hermanras/simple-proxy
+# (:latest and :sha-<commit>). Nothing is pushed that has not first been
+# started and talked to. Fork-only: not part of the upstream pull request.
+name: image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # Weekly, from scratch. A push-only build with the GHA layer cache reuses the
+  # package-upgrade layer until the Dockerfile changes, so OS security fixes never
+  # reach the image. This run pulls the bases again (a new Go patch release
+  # rebuilds the binary with its fixes), skips the cache and publishes.
+  # (GitHub pauses schedules after 60 days without repository activity.)
+  schedule:
+    - cron: "17 4 * * 1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # tags, for the version string
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Work out the image name and version
+        # Docker repository names must be lowercase; `HermanRas` is rejected.
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/simple-proxy" >> "$GITHUB_ENV"
+          echo "SOURCE=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" >> "$GITHUB_ENV"
+          echo "VERSION=$(git describe --tags --always)" >> "$GITHUB_ENV"
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          pull: true
+          no-cache: ${{ github.event_name == 'schedule' }}
+          context: .
+          load: true
+          build-args: VERSION=${{ env.VERSION }}
+          tags: simple-proxy:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: It proxies HTTP and HTTPS and enforces basic auth
+        run: |
+          fail() { echo "::error::$1"; docker logs sp; docker logs sp-auth; exit 1; }
+          docker run -d --name sp -p 8888:8888 simple-proxy:ci
+          docker run -d --name sp-auth -p 8889:8888 simple-proxy:ci --basic-auth user:pass
+          sleep 2
+          code() { curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$@"; }
+
+          [ "$(docker run --rm simple-proxy:ci --version)" = "$VERSION" ] || fail "--version is not $VERSION"
+          [ "$(code -x http://localhost:8888 http://example.com/)" = 200 ] || fail "HTTP via the proxy failed"
+          [ "$(code -x http://localhost:8888 https://example.com/)" = 200 ] || fail "HTTPS (CONNECT) via the proxy failed"
+          [ "$(code -x http://localhost:8889 http://example.com/)" = 407 ] || fail "no credentials was not refused"
+          [ "$(code -x http://user:nope@localhost:8889 http://example.com/)" = 407 ] || fail "wrong credentials were not refused"
+          [ "$(code -x http://user:pass@localhost:8889 https://example.com/)" = 200 ] || fail "right credentials were refused"
+          [ "$(docker exec sp id -u)" != 0 ] || fail "the proxy runs as root"
+
+      - name: Tear down
+        if: always()
+        run: docker rm -f sp sp-auth || true
+
+      - name: Log in to GHCR
+        if: (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        if: (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v6
+        with:
+          pull: true
+          context: .
+          push: true
+          build-args: VERSION=${{ env.VERSION }}
+          # Links the package to this public repository, so it is public too.
+          labels: |
+            org.opencontainers.image.source=${{ env.SOURCE }}
+            org.opencontainers.image.description=Simple HTTP/HTTPS proxy — security-maintained image of jthomperoo/simple-proxy
+            org.opencontainers.image.licenses=MIT
+          # `latest` is what a host pulls; `sha-…` is what you pin to roll back.
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          cache-from: type=gha

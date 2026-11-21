@@ -1,5 +1,12 @@
 # Simple Proxy
 
+> **Security-maintained image** of [jthomperoo/simple-proxy](https://github.com/jthomperoo/simple-proxy): this fork
+> publishes a container image that is rebuilt every week from fresh base images and the latest Go patch release.
+>
+> ```bash
+> docker run -p 8888:8888 ghcr.io/hermanras/simple-proxy:latest
+> ```
+
 This is a simple HTTP/HTTPS proxy - designed to be distributed as a self-contained binary that can be dropped in
 anywhere and run.
 
